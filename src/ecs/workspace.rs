@@ -484,7 +484,10 @@ fn find_orphaned_workspaces(
     let present = window_manager.present_displays();
 
     for (orphan, orphan_entity, timeout, child) in orphans {
-        if orphan.len() == 0 {
+        // Row 0 is the row every space is created with, so it is re-parented
+        // like a populated strip: despawning it leaves the space numbered from
+        // "2" with no row that any switch or reap path recreates.
+        if orphan.len() == 0 && orphan.virtual_index > 0 {
             if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
                 cmd.try_despawn();
             }
@@ -939,9 +942,6 @@ fn switch_virtual_workspace_bind(
                 .iter()
                 .position(|(_, strip, _)| strip.virtual_index == *target_virtual_index)
             else {
-                if *target_virtual_index == 0 {
-                    return;
-                }
                 commands.spawn_layout_strip(
                     LayoutStrip::new(workspace_id, *target_virtual_index),
                     active_display.bounds().min,
@@ -1003,7 +1003,7 @@ fn switch_virtual_workspace_bind(
 /// Handles the keybinding to move windows between virtual workspaces.
 /// Missing destinations are created by `handle_virtual_window_moves`. South at
 /// the last row only proceeds when `create_workspace_automatically` is on;
-/// numbered targets always may create (except index 0).
+/// numbered targets always may create, row 0 included.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn move_virtual_workspace_bind(
     mut messages: MessageReader<Event>,
@@ -1067,11 +1067,6 @@ fn move_virtual_workspace_bind(
         }
         Operation::VirtualMoveNumber(target_virtual_index, move_focus) => {
             if *target_virtual_index == current_virtual_index {
-                return;
-            }
-            if *target_virtual_index == 0
-                && !rows.iter().any(|(_, strip, _)| strip.virtual_index == 0)
-            {
                 return;
             }
             (*target_virtual_index, *move_focus)

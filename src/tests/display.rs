@@ -686,3 +686,58 @@ fn test_center_survives_display_round_trip() {
         })
         .run(commands);
 }
+
+/// An empty row 0 must survive its display going away. Despawning it left the
+/// space renumbered from "2" — the menu bar lists only the rows that exist —
+/// with no switch or reap path that recreates row 0.
+#[test]
+fn test_empty_baseline_row_survives_display_removal() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::DisplayRemoved {
+            display_id: TEST_DISPLAY_ID,
+        },
+        Event::DisplayAdded {
+            display_id: TEST_DISPLAY_ID,
+        },
+    ];
+
+    TestHarness::new()
+        .on_iteration(0, |world, state| {
+            let strips = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .map(|strip| strip.virtual_index)
+                .collect::<Vec<_>>();
+            assert_eq!(strips, vec![0], "the space starts with an empty row 0");
+            state.remove_display(TEST_DISPLAY_ID);
+        })
+        .on_iteration(1, |world, mut state| {
+            let entity = world
+                .query_filtered::<Entity, With<LayoutStrip>>()
+                .single(world)
+                .expect("empty row 0 should be orphaned, not despawned");
+            assert!(
+                world.entity(entity).get::<Timeout>().is_some(),
+                "orphaned row 0 should carry a timeout"
+            );
+            state.add_display(
+                TEST_DISPLAY_ID,
+                IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+                vec![TEST_WORKSPACE_ID],
+            );
+        })
+        .on_iteration(2, |world, _state| {
+            let entity = world
+                .query_filtered::<Entity, With<LayoutStrip>>()
+                .single(world)
+                .expect("row 0 should still exist after the display returns");
+            assert!(
+                world.entity(entity).get::<ChildOf>().is_some(),
+                "row 0 should be re-parented to the returning display"
+            );
+        })
+        .run(commands);
+}

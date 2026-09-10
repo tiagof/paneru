@@ -654,6 +654,51 @@ fn test_startup_restore_keeps_one_selected_row_and_hides_inactive_rows() {
     );
 }
 
+/// Restore consumes row 0's windows onto the saved rows, which empties row 0.
+/// Despawning it there left the restored space numbered from "2", so the
+/// emptied baseline row is kept.
+#[test]
+fn test_startup_restore_keeps_emptied_baseline_row() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![saved_display(TEST_DISPLAY_ID, true)],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: TEST_WORKSPACE_ID,
+            display_id: Some(TEST_DISPLAY_ID),
+            active_virtual_index: Some(1),
+            strips: vec![SavedStrip {
+                virtual_index: 1,
+                columns: vec![
+                    SavedColumn::Single(saved_window(0)),
+                    SavedColumn::Single(saved_window(1)),
+                ],
+            }],
+        }],
+    });
+
+    for _ in 0..5 {
+        harness.app.update();
+    }
+
+    let world = harness.world();
+    let mut query = world.query::<(&LayoutStrip, Has<crate::ecs::ActiveWorkspaceMarker>)>();
+    let mut rows = query
+        .iter(world)
+        .filter(|(strip, _)| strip.id() == TEST_WORKSPACE_ID)
+        .map(|(strip, active)| (strip.virtual_index, strip.all_windows().len(), active))
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+
+    assert_eq!(
+        rows,
+        vec![(0, 0, false), (1, 2, true)],
+        "restore should keep the emptied row 0 alongside the restored row 1"
+    );
+}
+
 fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
     SavedDisplay {
         display_id,

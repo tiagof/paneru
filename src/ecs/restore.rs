@@ -465,7 +465,11 @@ pub(super) fn restore_window_state(
             strip.remove(*entity);
         }
 
-        if had_consumed_window && strip.all_windows().is_empty() {
+        // Row 0 is the row every space is created with. Emptying it is normal
+        // (its windows move onto the restored rows), but despawning it leaves
+        // the space numbered from "2" with no row that any later switch or
+        // reap path recreates, so it is kept and reused instead.
+        if had_consumed_window && strip.all_windows().is_empty() && strip.virtual_index > 0 {
             emptied_existing_strips.insert(entity);
         }
     }
