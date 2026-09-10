@@ -432,15 +432,16 @@ impl MenuBarManager {
             return true;
         }
 
+        let (origin_x, length) = status_item_metrics(width);
         let origin_y = ((self.status_bar.thickness() - height) / 2.0).max(0.0);
         view.setTranslatesAutoresizingMaskIntoConstraints(true);
         view.setFrame(CGRect::new(
-            CGPoint::new(MENU_BAR_SPACING, origin_y),
+            CGPoint::new(origin_x, origin_y),
             CGSize::new(width, height),
         ));
         button.addSubview(view);
         button.setToolTip(Some(&NSString::from_str("Paneru window manager")));
-        self.status_item.setLength(width);
+        self.status_item.setLength(length);
         true
     }
 
@@ -625,6 +626,16 @@ pub fn update_menu_bar(
     );
 }
 
+/// Where the content sits inside the status item, and how wide that item has
+/// to be: [`MENU_BAR_SPACING`] of padding on both sides of the content. Sizing
+/// the item to the bare content width instead leaves the content pushed right
+/// by one padding and clipped by the same amount on the other side - obvious
+/// once the descriptor is hidden and the item is only a digit wide.
+fn status_item_metrics(content_width: CGFloat) -> (CGFloat, CGFloat) {
+    let length = content_width + 2.0 * MENU_BAR_SPACING;
+    ((length - content_width) / 2.0, length)
+}
+
 pub(crate) fn virtual_workspace_label(virtual_index: u32) -> String {
     (virtual_index + 1).to_string()
 }
@@ -758,9 +769,9 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGSize};
 
     use super::{
-        IndicatorFormat, WindowMenuEnablement, indicator_label, normalized_width_percentages,
-        paged_last_index, roman_numeral, unit_point_for_angle, virtual_workspace_label,
-        window_menu_enablement,
+        IndicatorFormat, MENU_BAR_SPACING, WindowMenuEnablement, indicator_label,
+        normalized_width_percentages, paged_last_index, roman_numeral, status_item_metrics,
+        unit_point_for_angle, virtual_workspace_label, window_menu_enablement,
     };
 
     const EPSILON: f64 = 1e-9;
@@ -935,5 +946,24 @@ mod tests {
                 toggle_managed: true,
             }
         );
+    }
+
+    #[test]
+    fn status_item_reserves_padding_on_both_sides_of_the_content() {
+        // A single digit with the descriptor hidden: the case where an
+        // unaccounted padding is a large fraction of the item.
+        for content_width in [1.0, 9.0, 42.0, 137.5] {
+            let (origin_x, length) = status_item_metrics(content_width);
+
+            assert!(
+                (origin_x + content_width + origin_x - length).abs() < EPSILON,
+                "content of {content_width} should be centred in an item of {length}, \
+                 sitting at {origin_x}"
+            );
+            assert!(
+                (origin_x - MENU_BAR_SPACING).abs() < EPSILON,
+                "content should keep its {MENU_BAR_SPACING}pt leading padding, got {origin_x}"
+            );
+        }
     }
 }
