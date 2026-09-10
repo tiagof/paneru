@@ -1,19 +1,18 @@
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::system::{NonSendMut, Query, Res};
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSBitmapImageRep, NSColor, NSControlStateValueOff, NSControlStateValueOn,
-    NSDeviceRGBColorSpace, NSFont, NSImage, NSImageScaling, NSImageView, NSLayoutAttribute, NSMenu,
-    NSMenuItem, NSScreen, NSStackView, NSStatusBar, NSStatusItem, NSTextField,
+    NSBezierPath, NSBitmapImageRep, NSCellImagePosition, NSColor, NSCompositingOperation,
+    NSControlStateValueOff, NSControlStateValueOn, NSDeviceRGBColorSpace, NSFont, NSGradient,
+    NSGraphicsContext, NSImage, NSImageScaling, NSImageView, NSLayoutAttribute, NSMenu, NSMenuItem,
+    NSScreen, NSStackView, NSStatusBar, NSStatusItem, NSTextField,
     NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView,
 };
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSInteger, NSObject, NSString};
-use objc2_quartz_core::{CAGradientLayer, CALayer};
 use tracing::warn;
 
 use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
@@ -307,7 +306,7 @@ impl MenuBarManager {
         field.sizeToFit();
         let size = field.frame().size;
 
-        if self.install(&field, size.width, size.height) {
+        if self.install(self.content_image(&field, size).as_deref()) {
             self.current_content = Some(content);
         }
     }
@@ -341,67 +340,99 @@ impl MenuBarManager {
             fitting.height.min(self.status_bar.thickness()),
         );
 
-        let installed = match self.gradient_view(config, &stack, size) {
-            Some(gradient) => self.install(&gradient, size.width, size.height),
-            None => self.install(&stack, size.width, size.height),
-        };
-        if installed {
+        let image = self.content_image(&stack, size).map(|image| {
+            self.colorized(config, &image, size)
+                .unwrap_or_else(|| image.clone())
+        });
+        if self.install(image.as_deref()) {
             self.current_content = Some(content);
         }
     }
 
-    /// Wraps `content` in a view hosting a [`CAGradientLayer`] masked by a
-    /// bitmap render of `content`, so the configured colours fill the glyphs
-    /// themselves rather than the box around them.
+    /// Bakes `content` into the image the status item button draws.
     ///
-    /// Returns `None` when there is no gradient to draw or any step of the
-    /// render fails, leaving the caller to install `content` untouched.
-    fn gradient_view(
-        &self,
-        config: &Config,
-        content: &NSView,
-        size: CGSize,
-    ) -> Option<Retained<NSView>> {
-        let gradient = config.menubar_gradient();
-        if gradient.is_empty() || size.width <= 0.0 || size.height <= 0.0 {
+    /// The button gets an image rather than `content` itself as a subview:
+    /// `AppKit` snapshots a status item's button into its menu bar replicants,
+    /// and a live subview - auto layout, or a hosted layer - re-dirties itself
+    /// on every snapshot, so the two feed each other in a loop that pins the
+    /// main thread at ~75% of a core and starves the run loop the event tap is
+    /// serviced on: the tap times out, macOS switches it off and every
+    /// keybinding falls through to whatever app is focused. A flat image is
+    /// snapshotted once and never invalidates itself.
+    ///
+    /// The image is a template, so `AppKit` tints it for the current menu bar
+    /// appearance - light or dark, and inverted while the menu is open - which
+    /// only the alpha channel of the render takes part in. [`colorized`]
+    /// replaces that with the configured colours where there are any.
+    ///
+    /// [`colorized`]: Self::colorized
+    fn content_image(&self, content: &NSView, size: CGSize) -> Option<Retained<NSImage>> {
+        if size.width <= 0.0 || size.height <= 0.0 {
             return None;
         }
         let bounds = CGRect::new(CGPoint::ZERO, size);
-        let scale = self.backing_scale_factor();
+        let rep = render_content_bitmap(content, bounds, self.backing_scale_factor())?;
 
-        let rep = render_content_bitmap(content, bounds, scale)?;
-        let image = rep.CGImage()?;
-        let mask = CALayer::new();
-        mask.setFrame(bounds);
-        mask.setContentsScale(scale);
-        unsafe { mask.setContents(Some(AsRef::<AnyObject>::as_ref(&*image))) };
+        let image = NSImage::initWithSize(NSImage::alloc(), size);
+        image.addRepresentation(&rep);
+        image.setTemplate(true);
+        Some(image)
+    }
 
-        let colors = gradient
+    /// Fills the glyphs of `content` with the configured colours, so they
+    /// carry the gradient themselves rather than the box around them.
+    ///
+    /// Returns `None` when no colours are configured, or when the render fails
+    /// at any step: the template image the caller already has follows the menu
+    /// bar's own appearance, which a baked colour would override in one of the
+    /// two themes anyway.
+    fn colorized(
+        &self,
+        config: &Config,
+        content: &NSImage,
+        size: CGSize,
+    ) -> Option<Retained<NSImage>> {
+        let colors = config
+            .menubar_gradient()
             .into_iter()
             .map(|(red, green, blue)| {
-                NSColor::colorWithSRGBRed_green_blue_alpha(red, green, blue, 1.0).CGColor()
+                NSColor::colorWithSRGBRed_green_blue_alpha(red, green, blue, 1.0)
             })
             .collect::<Vec<_>>();
-        let color_objects = colors
-            .iter()
-            .map(|color| AsRef::<AnyObject>::as_ref(&**color))
-            .collect::<Vec<_>>();
-
-        let angle = config.menubar_gradient_angle();
-        let layer = CAGradientLayer::new();
-        layer.setFrame(bounds);
-        layer.setContentsScale(scale);
-        layer.setStartPoint(unit_point_for_angle(size, angle + 180.0));
-        layer.setEndPoint(unit_point_for_angle(size, angle));
-        unsafe {
-            layer.setColors(Some(&NSArray::from_slice(&color_objects)));
-            layer.setMask(Some(&mask));
+        if colors.is_empty() {
+            return None;
         }
 
-        let view = NSView::new(self.mtm);
-        view.setLayer(Some(&layer));
-        view.setWantsLayer(true);
-        Some(view)
+        let bounds = CGRect::new(CGPoint::ZERO, size);
+        let rep = bitmap_rep(bounds, self.backing_scale_factor())?;
+        let canvas = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&canvas));
+        let color_refs = colors.iter().map(|color| &**color).collect::<Vec<_>>();
+        // A single colour is a gradient with nowhere to go, and `NSGradient`
+        // refuses to be built from one.
+        if let Some(gradient) =
+            NSGradient::initWithColors(NSGradient::alloc(), &NSArray::from_slice(&color_refs))
+        {
+            gradient.drawInRect_angle(bounds, config.menubar_gradient_angle());
+        } else {
+            colors[0].setFill();
+            NSBezierPath::fillRect(bounds);
+        }
+        // Keeps the fill only where the content drew, punching the glyphs out
+        // of the colour rather than painting a coloured box behind them.
+        content.drawInRect_fromRect_operation_fraction(
+            bounds,
+            CGRect::ZERO,
+            NSCompositingOperation::DestinationIn,
+            1.0,
+        );
+        NSGraphicsContext::restoreGraphicsState_class();
+
+        let image = NSImage::initWithSize(NSImage::alloc(), size);
+        image.addRepresentation(&rep);
+        Some(image)
     }
 
     /// The scale the mask bitmap has to be rendered at. It cannot be read back
@@ -417,30 +448,31 @@ impl MenuBarManager {
             .unwrap_or(1.0)
     }
 
-    fn install(&self, view: &NSView, width: CGFloat, height: CGFloat) -> bool {
+    /// Draws `image` in the status item, or empties the item when there is
+    /// nothing to draw.
+    ///
+    /// The item keeps [`NSVariableStatusItemLength`]: `AppKit` sizes it around
+    /// the image, padding included, which is what the item's own content
+    /// insets are for - measuring the content and setting the length by hand
+    /// left it off-centre by exactly one padding.
+    fn install(&self, image: Option<&NSImage>) -> bool {
         let Some(button) = self.status_item.button(self.mtm) else {
             warn!("unable to update menu bar: status item has no button");
             return false;
         };
 
-        for subview in button.subviews() {
-            subview.removeFromSuperview();
-        }
-
-        if width <= 0.0 {
+        let Some(image) = image else {
+            button.setImage(None);
             self.status_item.setLength(0.0);
             return true;
-        }
+        };
 
-        let origin_y = ((self.status_bar.thickness() - height) / 2.0).max(0.0);
-        view.setTranslatesAutoresizingMaskIntoConstraints(true);
-        view.setFrame(CGRect::new(
-            CGPoint::new(MENU_BAR_SPACING, origin_y),
-            CGSize::new(width, height),
-        ));
-        button.addSubview(view);
+        button.setImage(Some(image));
+        // A button starts out at `NSNoImage`, which draws its (empty) title and
+        // nothing else: the item goes blank without this.
+        button.setImagePosition(NSCellImagePosition::ImageOnly);
         button.setToolTip(Some(&NSString::from_str("Paneru window manager")));
-        self.status_item.setLength(width);
+        self.status_item.setLength(NSVariableStatusItemLength);
         true
     }
 
@@ -682,19 +714,26 @@ fn roman_numeral(value: u32) -> String {
     numeral
 }
 
-/// Renders `content` into a bitmap at `scale`, for use as a [`CALayer`] mask:
-/// only the alpha channel is read back, so the colors `AppKit` happens to draw
-/// the labels in do not matter.
+/// Renders `content` into a bitmap at `scale`, the flat stand-in the status
+/// item button draws instead of `content` itself.
 fn render_content_bitmap(
     content: &NSView,
     bounds: CGRect,
     scale: CGFloat,
 ) -> Option<Retained<NSBitmapImageRep>> {
-    let pixels_wide = NSInteger::try_from(round_px(bounds.size.width * scale)).ok()?;
-    let pixels_high = NSInteger::try_from(round_px(bounds.size.height * scale)).ok()?;
-
     content.setFrame(bounds);
     content.layoutSubtreeIfNeeded();
+
+    let rep = bitmap_rep(bounds, scale)?;
+    content.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
+    Some(rep)
+}
+
+/// An empty `bounds`-sized bitmap to draw into, backed by `scale` pixels per
+/// point so the render survives a Retina menu bar.
+fn bitmap_rep(bounds: CGRect, scale: CGFloat) -> Option<Retained<NSBitmapImageRep>> {
+    let pixels_wide = NSInteger::try_from(round_px(bounds.size.width * scale)).ok()?;
+    let pixels_high = NSInteger::try_from(round_px(bounds.size.height * scale)).ok()?;
 
     let rep = unsafe {
         NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
@@ -712,32 +751,7 @@ fn render_content_bitmap(
         )
     }?;
     rep.setSize(bounds.size);
-    content.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
     Some(rep)
-}
-
-/// The point where a ray leaving the center of a `size`-sized rectangle at
-/// `degrees` crosses that rectangle's edge, in the unit coordinate space
-/// [`CAGradientLayer`] takes its start and end points in.
-///
-/// Angles run counter-clockwise from 0° pointing right, matching the layer's
-/// unflipped geometry: 90° is the top edge, 270° the bottom one.
-fn unit_point_for_angle(size: CGSize, degrees: f64) -> CGPoint {
-    let center = CGPoint::new(0.5, 0.5);
-    if size.width <= 0.0 || size.height <= 0.0 {
-        return center;
-    }
-
-    let (sin, cos) = degrees.to_radians().sin_cos();
-
-    let to_side = (size.width / 2.0) / cos.abs();
-    let to_cap = (size.height / 2.0) / sin.abs();
-    let distance = to_side.min(to_cap);
-
-    CGPoint::new(
-        center.x + distance * cos / size.width,
-        center.y + distance * sin / size.height,
-    )
 }
 
 fn normalized_width_percentages(widths: &[f64]) -> Vec<i32> {
@@ -755,24 +769,10 @@ fn normalized_width_percentages(widths: &[f64]) -> Vec<i32> {
 
 #[cfg(test)]
 mod tests {
-    use objc2_core_foundation::{CGPoint, CGSize};
-
     use super::{
         IndicatorFormat, WindowMenuEnablement, indicator_label, normalized_width_percentages,
-        paged_last_index, roman_numeral, unit_point_for_angle, virtual_workspace_label,
-        window_menu_enablement,
+        paged_last_index, roman_numeral, virtual_workspace_label, window_menu_enablement,
     };
-
-    const EPSILON: f64 = 1e-9;
-
-    fn assert_unit_point(point: CGPoint, x: f64, y: f64) {
-        assert!(
-            (point.x - x).abs() < EPSILON && (point.y - y).abs() < EPSILON,
-            "expected ({x}, {y}), got ({}, {})",
-            point.x,
-            point.y
-        );
-    }
 
     #[test]
     fn virtual_workspace_label_is_one_based() {
@@ -860,55 +860,6 @@ mod tests {
         assert_eq!(
             normalized_width_percentages(&[2.0, 0.5, 1.5, 0.5, 0.001, f64::NAN, -1.0]),
             vec![50, 150, 200]
-        );
-    }
-
-    #[test]
-    fn cardinal_gradient_angles_hit_edge_midpoints() {
-        let size = CGSize::new(100.0, 20.0);
-        assert_unit_point(unit_point_for_angle(size, 0.0), 1.0, 0.5);
-        assert_unit_point(unit_point_for_angle(size, 90.0), 0.5, 1.0);
-        assert_unit_point(unit_point_for_angle(size, 180.0), 0.0, 0.5);
-        assert_unit_point(unit_point_for_angle(size, 270.0), 0.5, 0.0);
-    }
-
-    #[test]
-    fn gradient_angles_leave_through_the_nearer_edge() {
-        // 45° out of a wide, short rect reaches the top long before the side,
-        // and out of a square it lands exactly on the corner.
-        assert_unit_point(
-            unit_point_for_angle(CGSize::new(100.0, 20.0), 45.0),
-            0.6,
-            1.0,
-        );
-        assert_unit_point(
-            unit_point_for_angle(CGSize::new(40.0, 40.0), 45.0),
-            1.0,
-            1.0,
-        );
-    }
-
-    #[test]
-    fn gradient_angles_wrap_and_stay_opposite() {
-        let size = CGSize::new(64.0, 22.0);
-        assert_unit_point(unit_point_for_angle(size, 450.0), 0.5, 1.0);
-        assert_unit_point(unit_point_for_angle(size, -90.0), 0.5, 0.0);
-
-        // What the caller relies on: the start and end of a gradient sit on
-        // opposite sides of the centre.
-        let start = unit_point_for_angle(size, 30.0 + 180.0);
-        let end = unit_point_for_angle(size, 30.0);
-        assert!((start.x + end.x - 1.0).abs() < EPSILON);
-        assert!((start.y + end.y - 1.0).abs() < EPSILON);
-    }
-
-    #[test]
-    fn gradient_angles_on_a_degenerate_rect_stay_centred() {
-        assert_unit_point(unit_point_for_angle(CGSize::new(0.0, 20.0), 45.0), 0.5, 0.5);
-        assert_unit_point(
-            unit_point_for_angle(CGSize::new(100.0, 0.0), 45.0),
-            0.5,
-            0.5,
         );
     }
 
